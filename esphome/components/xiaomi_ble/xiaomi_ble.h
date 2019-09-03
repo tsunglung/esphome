@@ -9,13 +9,16 @@ namespace esphome {
 namespace xiaomi_ble {
 
 struct XiaomiParseResult {
-  enum { TYPE_MIJIA, TYPE_MIFLORA, TYPE_LYWSD02 } type;
+  enum { TYPE_MIJIA, TYPE_MIFLORA, TYPE_MISCALE , TYPE_LYWSD02 } type;
   optional<float> temperature;
   optional<float> humidity;
   optional<float> battery_level;
   optional<float> conductivity;
   optional<float> illuminance;
   optional<float> moisture;
+  optional<float> weight;
+  optional<float> impedance;
+  optional<time_t> datetime;
 };
 
 bool parse_xiaomi_data_byte(uint8_t data_type, const uint8_t *data, uint8_t data_length, XiaomiParseResult &result);
