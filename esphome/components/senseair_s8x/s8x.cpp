@@ -4,10 +4,11 @@
 namespace esphome {
 namespace s8x {
 
+#define S8X_PREAMBLE_LENGTH 2
 static const char *TAG = "s8x";
 static const uint8_t S8X_REQUEST_LENGTH = 8;
-static const uint8_t S8X_RESPONSE_LENGTH = 7;
-static const uint8_t S8X_COMMAND_GET_PPM[] = {0xFE, 0x04, 0x00, 0x03, 0x00, 0x01, 0xD5, 0xC5};  //Command packet to read CO2 (see app note), CRC 0xC5D5
+static const uint8_t S8X_RESPONSE_LENGTH = 13;
+static const uint8_t S8X_COMMAND_GET_PPM[] = {0xFE, 0x04, 0x00, 0x00, 0x00, 0x04, 0xE5, 0xC6};  //Command packet to read CO2 (see app note), CRC 0xC6E5
 
 // ---=== Calc CRC16 ===---
 uint16_t s8x_checksum(uint8_t *ptr, uint8_t length) {
@@ -41,17 +42,19 @@ void S8XComponent::update() {
     return;
   }
 
-  uint16_t checksum = s8x_checksum(response, 5);
-  if (((response[6] << 8) | response[5]) != checksum) {
-    ESP_LOGW(TAG, "SenseAir S8 Checksum doesn't match: 0x%02X!=0x%02X", response[6], checksum);
+  uint16_t checksum = s8x_checksum(response, S8X_RESPONSE_LENGTH - 2);
+  if (((response[S8X_RESPONSE_LENGTH - 1] << 8) | response[S8X_RESPONSE_LENGTH - 2]) != checksum) {
+    ESP_LOGW(TAG, "SenseAir S8 Checksum doesn't match: 0x%02X!=0x%02X", ((response[12] << 8) | response[11]), checksum);
     this->status_set_warning();
     return;
   }
 
   this->status_clear_warning();
-  const uint16_t ppm = (uint16_t(response[3]) << 8) | response[4];
+  const uint8_t length = response[2];
+  const uint16_t status = (uint16_t(response[3]) << 8) | response[4];
+  const uint16_t ppm = (uint16_t(response[S8X_PREAMBLE_LENGTH + length - 1]) << 8) | response[S8X_PREAMBLE_LENGTH + length];
 
-  ESP_LOGD(TAG, "SenseAir S8 Received CO₂=%uppm", ppm);
+  ESP_LOGD(TAG, "SenseAir S8 Received CO₂=%uppm, status = %x", ppm, status);
   if (this->co2_sensor_ != nullptr)
     this->co2_sensor_->publish_state(ppm);
 }
