@@ -66,12 +66,18 @@ from esphome.helpers import rmtree, write_file_if_changed
 from esphome.storage_json import StorageJSON
 from esphome.types import ConfigType
 
+from . import partitions as nrf52_partitions
 from .boards import BOARDS_ZEPHYR, BOOTLOADER_CONFIG
 from .const import (
     BOOTLOADER_ADAFRUIT,
     BOOTLOADER_ADAFRUIT_NRF52_SD132,
     BOOTLOADER_ADAFRUIT_NRF52_SD140_V6,
     BOOTLOADER_ADAFRUIT_NRF52_SD140_V7,
+    BOOTLOADER_NRF_SDFU,
+    BOOTLOADER_SEEED_VID,
+    BOOTLOADER_XIAO_BLE_PID,
+    BOOTLOADER_NORDIC_VID,
+    BOOTLOADER_NORDIC_DK_PID,
 )
 from .framework import (
     check_and_install,
@@ -198,6 +204,7 @@ BOOTLOADERS = [
     BOOTLOADER_ADAFRUIT_NRF52_SD140_V6,
     BOOTLOADER_ADAFRUIT_NRF52_SD140_V7,
     BOOTLOADER_MCUBOOT,
+    BOOTLOADER_NRF_SDFU,
 ]
 
 
@@ -420,6 +427,31 @@ async def to_code(config: ConfigType) -> None:
     if dfu_config := config.get(CONF_DFU):
         CORE.add_job(_dfu_to_code, dfu_config)
     framework_ver: cv.Version = CORE.data[KEY_CORE][KEY_FRAMEWORK_VERSION]
+    if framework_ver >= cv.Version(3, 0, 0):
+        cg.add_build_flag("-DFRAMEWORK_VERSION3")
+    if (
+        "zigbee" in CORE.loaded_integrations
+        and CORE.using_toolchain_sdk_nrf
+        and framework_ver >= cv.Version(3, 4, 0)
+    ):
+        # ncs-zigbee (R23) hard-requires zboss_nvram/zboss_product_config as real
+        # devicetree fixed-partitions when Partition Manager is disabled (see the
+        # BUILD_ASSERT(FIXED_PARTITION_EXISTS(...)) calls in zb_nrf_nvram.c). See
+        # partitions.py for why this is split by devicetree scheme and coordinated
+        # with ota/zephyr_mcumgr's own partition rebuild instead of computed here
+        # in isolation.
+        if config[KEY_BOOTLOADER] in [BOOTLOADER_MCUBOOT, BOOTLOADER_NRF_SDFU]:
+            zephyr_add_overlay(nrf52_partitions.native_scheme_zigbee_overlay())
+        #elif "ota" not in CORE.loaded_integrations:
+        else:
+            zephyr_add_overlay(
+                nrf52_partitions.uf2_scheme_code_partition_overlay(
+                    BOOTLOADER_CONFIG[config[KEY_BOOTLOADER]]
+                )
+            )
+            # else: UF2 scheme + ota both present -- ota/zephyr_mcumgr's own
+            # to_code() (zephyr_mcumgr/ota/__init__.py) plans the whole rebuilt
+            # partition table, zboss included, in one place to avoid overlap.
     if CONF_DCDC in config:
         if framework_ver < cv.Version(2, 9, 2):
             zephyr_add_prj_conf("BOARD_ENABLE_DCDC", config[CONF_DCDC])
@@ -459,6 +491,9 @@ async def to_code(config: ConfigType) -> None:
     # watchdog
     zephyr_add_prj_conf("WATCHDOG", True)
     zephyr_add_prj_conf("WDT_DISABLE_AT_BOOT", False)
+    # disable console
+    zephyr_add_prj_conf("UART_CONSOLE", False)
+    zephyr_add_prj_conf("CONSOLE", False, False)
     # use NFC pins as GPIO
     if framework_ver < cv.Version(2, 9, 2):
         zephyr_add_prj_conf("NFCT_PINS_AS_GPIOS", True)
@@ -470,6 +505,24 @@ async def to_code(config: ConfigType) -> None:
                 };
             """
         )
+    if config[KEY_BOOTLOADER] == BOOTLOADER_NRF_SDFU:
+        # The nrf52840dongle board DTS enables uart0 unconditionally and its
+        # pinctrl maps UART RX to P0.24, RTS to P0.17 and CTS to P0.22. The
+        # dongle has no wired serial console, and those pins are the ones
+        # exposed on the castellated edge for GPIO use — disable uart0 so
+        # nothing claims them.
+        zephyr_add_overlay(
+            """
+                &uart0 {
+                    status = "disabled";
+                };
+
+                &timer2 {
+                    status = "okay";
+                };
+            """
+        )
+        cg.add_build_flag("-DCONFIG_DFU_NORDIC_MAGIC")
     zephyr_add_prj_conf("REBOOT", True)
 
     # some boards enable USB and UART by default.
@@ -484,7 +537,17 @@ async def to_code(config: ConfigType) -> None:
     zephyr_add_prj_conf("PRINTK", False, False)
     zephyr_add_prj_conf("CONSOLE", False, False)
     zephyr_add_prj_conf("UART_CONSOLE", False)
-
+    if zephyr_data()[KEY_BOARD] == "xiao_ble_sense":
+        zephyr_add_prj_conf("SPI", True)
+        zephyr_add_prj_conf("I2C", True)
+        zephyr_add_prj_conf("I2S", True)
+        zephyr_add_overlay(
+            """
+                &i2c0 {
+                    status = "okay";
+                };
+            """
+        )
 
 @coroutine_with_priority(CoroPriority.DIAGNOSTICS)
 async def _dfu_to_code(dfu_config):
@@ -518,7 +581,7 @@ def copy_files() -> None:
 
     if CORE.using_toolchain_platformio and (
         zephyr_data()[KEY_BOOTLOADER] == BOOTLOADER_MCUBOOT
-        or zephyr_data()[KEY_BOARD] == "xiao_ble"
+        or "xiao_ble" in zephyr_data()[KEY_BOARD]
     ):
         write_file_if_changed(
             CORE.relative_build_path(f"boards/{zephyr_data()[KEY_BOARD]}.json"),
@@ -606,6 +669,7 @@ def upload_program(config: ConfigType, args, host: str) -> bool:
         set_core_data(platform_config)
         set_framework(platform_config)
 
+    zigbee = "zigbee" in config
     mcumgr_device: str | None = None
 
     if get_port_type(host) == PortType.SERIAL:
@@ -617,14 +681,15 @@ def upload_program(config: ConfigType, args, host: str) -> bool:
                 bootloader = zephyr_data()[KEY_BOOTLOADER]
                 if bootloader not in (
                     BOOTLOADER_ADAFRUIT,
+                    BOOTLOADER_NRF_SDFU,
                     BOOTLOADER_ADAFRUIT_NRF52_SD132,
                     BOOTLOADER_ADAFRUIT_NRF52_SD140_V6,
                     BOOTLOADER_ADAFRUIT_NRF52_SD140_V7,
                 ):
                     raise EsphomeError("Not implemented yet")
-                check_and_install()
-                paths = get_build_paths()
-                env = get_build_env(None)  # no compile, just nrfutil
+                check_and_install(zigbee=zigbee)
+                paths = get_build_paths(zigbee=zigbee)
+                env = get_build_env(None, zigbee=zigbee)
                 build_dir = CORE.relative_pioenvs_path(CORE.name)
                 dfu_package = build_dir / "firmware.zip"
                 if not dfu_package.is_file():
@@ -634,47 +699,92 @@ def upload_program(config: ConfigType, args, host: str) -> bool:
                 import serial as _serial
                 import serial.tools.list_ports as _list_ports
 
-                try:
-                    ser = _serial.Serial(host, baudrate=1200, timeout=1)
-                    ser.close()
-                except _serial.SerialException as err:
-                    raise EsphomeError(f"Failed to open {host}: {err}") from err
-
-                # Wait for device to reset (port disappears)
-                deadline = _time.monotonic() + 5
-                while _time.monotonic() < deadline:
-                    _time.sleep(0.1)
-                    if host not in {p.device for p in _list_ports.comports()}:
+                sn = ""
+                in_serial_dfu = False
+                for p in _list_ports.comports():
+                    if (p.vid == BOOTLOADER_NORDIC_VID and p.pid == BOOTLOADER_NORDIC_DK_PID):
+                        in_serial_dfu = True
+                    if host == p.device:
+                        sn = p.serial_number
                         break
-                else:
-                    _LOGGER.warning(
-                        "Device did not leave %s within 5 s; "
-                        "it may not have entered bootloader mode",
-                        host,
-                    )
 
-                # Wait for DFU port to reappear
-                deadline = _time.monotonic() + 10
-                while _time.monotonic() < deadline:
-                    _time.sleep(0.1)
-                    if host in {p.device for p in _list_ports.comports()}:
-                        break
-                else:
-                    raise EsphomeError(
-                        f"DFU port {host!r} did not reappear within 10 s. "
-                        "Check that the device entered DFU mode."
-                    )
-
-                # Wait for udev to finish setting up device permissions
-                deadline = _time.monotonic() + 5
-                while _time.monotonic() < deadline:
+                if not in_serial_dfu:
                     try:
-                        check_permissions(host)
-                        break
-                    except EsphomeError:
-                        _time.sleep(0.05)
-                else:
-                    check_permissions(host)  # raises with helpful message
+                        # Adafruit bootloader: 1200bps touch forces a reset
+                        # into the bootloader.
+                        ser = _serial.Serial(host, baudrate=1200, timeout=1)
+                        ser.close()
+                        # BOOTLOADER_NRF_SDFU (Nordic Open DFU Bootloader) has no
+                        # auto-entry: the user enters it by holding SW1 during
+                        # power-up. The port wait below handles both cases.
+                    except _serial.SerialException as err:
+                        raise EsphomeError(f"Failed to open {host}: {err}") from err
+
+                    # Wait for device to reset (port disappears)
+                    deadline = _time.monotonic() + 5
+                    while _time.monotonic() < deadline:
+                        _time.sleep(0.1)
+                        if host not in {p.device for p in _list_ports.comports()}:
+                            break
+                    else:
+                        _LOGGER.warning(
+                            "Device did not leave %s within 5 s; "
+                            "it may not have entered bootloader mode",
+                            host,
+                        )
+
+                    # Wait for DFU port to reappear
+                    deadline = _time.monotonic() + 10
+                    while _time.monotonic() < deadline:
+                        _time.sleep(0.1)
+                        if host in {p.device for p in _list_ports.comports()}:
+                            break
+
+                        for p in _list_ports.comports():
+                            # xiao ble dfu loader
+                            if (p.vid == BOOTLOADER_SEEED_VID and p.pid == BOOTLOADER_XIAO_BLE_PID and p.serial_number == sn):
+                                host = p.device
+                                break
+                            # Nordic nrf52840 dongle (PCA100059)
+                            if (p.vid == BOOTLOADER_NORDIC_VID and p.pid == BOOTLOADER_NORDIC_DK_PID):
+                                host = p.device
+                                break
+                    else:
+                        raise EsphomeError(
+                            f"DFU port {host!r} was not available within 10 s. "
+                            "Enter bootloader mode first (on the nrf52840dongle: "
+                            "hold SW1 while plugging the device in)."
+                        )
+
+                    # Wait for udev to finish setting up device permissions
+                    deadline = _time.monotonic() + 5
+                    while _time.monotonic() < deadline:
+                        try:
+                            check_permissions(host)
+                            break
+                        except EsphomeError:
+                            _time.sleep(0.05)
+                    else:
+                        check_permissions(host)  # raises with helpful message
+
+                if bootloader in (
+                   BOOTLOADER_NRF_SDFU
+                ):
+                    if not run_command_ok(
+                        [
+                            str(paths["nrfutil_executable"]),
+                            "device",
+                            "program",
+                            "--traits",
+                            "nordicDfu",
+                            "--firmware",
+                            str(dfu_package)
+                        ],
+                        env=env,
+                        stream_output=True,
+                    ):
+                        raise EsphomeError("nRF52 serial DFU upload failed")
+                    return True
 
                 python = str(paths["python_executable"])
                 if not run_command_ok(
@@ -704,9 +814,9 @@ def upload_program(config: ConfigType, args, host: str) -> bool:
 
     if host == "PYOCD":
         if not CORE.using_toolchain_platformio:
-            check_and_install()
-            paths = get_build_paths()
-            env = get_build_env(resolve_ccache_path())  # west flash may rebuild
+            check_and_install(zigbee=zigbee)
+            paths = get_build_paths(zigbee=zigbee)
+            env = get_build_env(zigbee=zigbee)
             build_dir = CORE.relative_pioenvs_path(CORE.name)
             west_cmd = [
                 str(paths["python_executable"]),
@@ -989,13 +1099,14 @@ def run_compile(args, config: ConfigType) -> bool:
             "Unsupported toolchain for nRF52. "
             "Supported toolchains are 'platformio' and 'sdk-nrf'."
         )
-    check_and_install()
+    zigbee = "zigbee" in config
+    check_and_install(zigbee=zigbee)
 
-    paths = get_build_paths()
+    paths = get_build_paths(zigbee=zigbee)
     # Depend mode in the shared ccache settings keeps the .gch sound
     # across Kconfig flips.
     ccache = resolve_ccache_path()
-    env = get_build_env(ccache)
+    env = get_build_env(ccache, zigbee=zigbee)
 
     pch_on = _pch_usable()
     cmake_lists_changed = _generate_cmake_lists(pch_on)
@@ -1003,6 +1114,9 @@ def run_compile(args, config: ConfigType) -> bool:
     board = zephyr_data()[KEY_BOARD]
     build_dir = CORE.relative_pioenvs_path(CORE.name)
     source_dir = CORE.relative_build_path("zephyr")
+
+    if board == "xiao_ble_sense":
+        board = "xiao_ble/nrf52840/sense"
 
     # A missing CMake cache (dropped by zephyr's copy_files() on config
     # change) or a changed CMakeLists.txt requires a pristine build: Zephyr
@@ -1044,12 +1158,14 @@ def run_compile(args, config: ConfigType) -> bool:
     # The bootloader resets on a package whose sd_req does not list its SoftDevice,
     # so v7 accepts S140 7.0.1, 7.2.0 and 7.3.0 (e.g. Seeed XIAO nRF52840).
     _GENPKG_PARAMS = {
+        BOOTLOADER_NRF_SDFU: ("0x0052", "0x0000"),
         BOOTLOADER_ADAFRUIT_NRF52_SD132: ("0x0051", "0x009D"),
         BOOTLOADER_ADAFRUIT_NRF52_SD140_V6: ("0x0052", "0x00B6"),
         BOOTLOADER_ADAFRUIT_NRF52_SD140_V7: ("0x0052", "0x00CA,0x0100,0x0123"),
     }
     # UF2 family IDs — nRF52832 vs nRF52840 per SoftDevice variant
     _UF2_FAMILY_IDS = {
+        BOOTLOADER_NRF_SDFU: "0xADA52840",
         BOOTLOADER_ADAFRUIT_NRF52_SD132: "0x7EAED30A",
         BOOTLOADER_ADAFRUIT_NRF52_SD140_V6: "0xADA52840",
         BOOTLOADER_ADAFRUIT_NRF52_SD140_V7: "0xADA52840",
@@ -1065,7 +1181,13 @@ def run_compile(args, config: ConfigType) -> bool:
         _copy_if_exists(west_out / "zephyr.uf2", zephyr_dir / "zephyr.uf2")
         _copy_if_exists(west_out / "zephyr.signed.bin", zephyr_dir / "app_update.bin")
         _copy_if_exists(west_out / "zephyr.hex", zephyr_dir / "zephyr.hex")
-        _copy_if_exists(build_dir / "merged.hex", zephyr_dir / "merged.hex")
+        if framework_ver > cv.Version(3, 4, 0):
+            if zephyr_data()[KEY_BOARD] == "xiao_ble_sense":
+                _copy_if_exists(build_dir / f"merged_xiao_ble_nrf52840_sense.hex", zephyr_dir / "merged.hex")
+            else:
+                _copy_if_exists(build_dir / f"merged_{zephyr_data()[KEY_BOARD]}_nrf52840.hex", zephyr_dir / "merged.hex")
+        else:
+            _copy_if_exists(build_dir / "merged.hex", zephyr_dir / "merged.hex")
 
     # For Adafruit bootloader builds, regenerate the UF2 from a hex file.
     # merged.hex carries the correct flash addresses; SDK 3.4.0+ no longer
@@ -1098,6 +1220,26 @@ def run_compile(args, config: ConfigType) -> bool:
             stream_output=True,
         ):
             raise EsphomeError(f"Failed to generate UF2 from {hex_file.name}")
+
+    if bootloader in (
+        BOOTLOADER_NRF_SDFU
+    ):
+        hex_file = zephyr_dir / "merged.hex"
+        dfu_package = build_dir / "firmware.zip"
+        genpkg_cmd = [
+            str(paths["nrfutil_executable"]),
+            "nrf5sdk-tools",
+            "pkg",
+            "generate",
+            "--application-version",
+            "1"
+        ]
+        if bootloader in _GENPKG_PARAMS:
+            dev_type, sd_req = _GENPKG_PARAMS[bootloader]
+            genpkg_cmd += ["--hw-version", dev_type.replace("0x00", ""), "--sd-req", sd_req.replace("0x00", "0x")]
+        genpkg_cmd += ["--application", str(hex_file), str(dfu_package)]
+        if not run_command_ok(genpkg_cmd, env=env, stream_output=True):
+            raise EsphomeError("Failed to create nordic DFU package")
 
     if bootloader in (
         BOOTLOADER_ADAFRUIT,

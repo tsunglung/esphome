@@ -14,6 +14,7 @@ ESPHOME_LOG_TAG(TAG, "dfu");
 
 static const uint32_t DFU_DBL_RESET_MAGIC = 0x5A1AD5;  // SALADS
 static const uint8_t DFU_MAGIC_UF2_RESET = 0x57;       // Adafruit nRF52 bootloader UF2 magic
+static const uint8_t DFU_MAGIC_SDFU_RESET = 0x4E;       // Nordic nRF52 bootloader magic
 static const uint8_t DFU_MAGIC_SKIP = 0x6d;            // Adafruit nRF52 bootloader: start the app, skip DFU
 // Host-side baud rates that trigger an action; see DeviceFirmwareUpdate::setup().
 static const uint32_t DFU_TOUCH_BAUD_RATE = 1200;    // reboot into the bootloader (DFU)
@@ -37,7 +38,15 @@ void DeviceFirmwareUpdate::setup() {
       if (this->reset_pin_ != nullptr) {
         this->reset_pin_->digital_write(true);
       } else {
+#ifdef CONFIG_DFU_NORDIC_MAGIC
+#if NRF_POWER_HAS_GPREGRET
+        nrf_power_gpregret_set(NRF_POWER, 0, DFU_MAGIC_SDFU_RESET);
+#else
+        NRF_POWER->GPREGRET = DFU_MAGIC_SDFU_RESET;
+#endif
+#else
         NRF_POWER->GPREGRET = DFU_MAGIC_UF2_RESET;
+#endif
         arch_feed_wdt();
         App.reboot();
       }

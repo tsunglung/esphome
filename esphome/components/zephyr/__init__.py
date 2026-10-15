@@ -310,6 +310,9 @@ def copy_files() -> None:
     sysbuild_conf = ""
     if zephyr_data()[KEY_SYSBUILD]:
         sysbuild_conf = "SB_CONFIG_BOOTLOADER_MCUBOOT=y\n"
+    framework_ver: cv.Version = CORE.data[KEY_CORE][KEY_FRAMEWORK_VERSION]
+    if CORE.is_nrf52 and framework_ver >= cv.Version(3, 0, 0):
+        sysbuild_conf += "SB_CONFIG_MERGED_HEX_FILES=y\n"
     changed |= _write_file_if_changed_or_remove_when_empty(
         CORE.relative_build_path("zephyr/sysbuild.conf"), sysbuild_conf
     )

@@ -9,6 +9,10 @@
 #define IRAM_ATTR
 #define PROGMEM
 
+#ifndef BT_LE_ADV_CONN
+#define BT_LE_ADV_CONN BT_LE_ADV_CONN_FAST_2
+#endif
+
 namespace esphome::zephyr {}
 
 namespace esphome {
